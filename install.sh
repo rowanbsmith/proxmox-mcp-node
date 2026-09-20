@@ -356,13 +356,76 @@ fi
 # is the single most common way this ends up "installed but broken", and it
 # reports success at every layer that only checks status codes.
 say "Checking the token"
-CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+
+_ERRF="$(mktemp)"; trap 'rm -f "$_ERRF"' EXIT
+
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
   --cacert "$CONF_DIR/pve-ca.pem" -H "Authorization: $PVE_TOKEN" \
-  "https://$PROXMOX_HOST:8006/api2/json/version")" || true
-[[ "$CODE" == "200" ]] || die "Proxmox returned $CODE for /version.
-401 means the credential itself is rejected: wrong realm (@pam vs @pve),
-wrong secret, or a disabled account."
-note "authenticates (200)"
+  "https://$PROXMOX_HOST:8006/api2/json/version" 2>"$_ERRF")" || true
+# curl writes a multi-line explanation for TLS failures; the first line is the
+# one that names the actual problem ("curl: (60) SSL certificate problem:
+# ..."). The remaining lines are boilerplate pointing at a web page, so taking
+# the last line -- the obvious choice -- yields the least useful sentence.
+CURL_ERR="$(tr -d '\r' < "$_ERRF" | grep -m1 '^curl:' || tr -d '\r' < "$_ERRF" | head -1)"
+
+if [[ "$CODE" == "000" ]]; then
+  # No HTTP response at all -- the request never completed, so this is a
+  # transport problem and has nothing to do with the credential. Find out
+  # which one by retrying without verification: if that works, the CA is at
+  # fault; if it doesn't, we cannot reach the host.
+  INSECURE_CODE="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 \
+    -H "Authorization: $PVE_TOKEN" \
+    "https://$PROXMOX_HOST:8006/api2/json/version" 2>/dev/null)" || true
+
+  if [[ "$INSECURE_CODE" != "000" ]]; then
+    die "TLS verification against the pinned Proxmox CA failed.
+
+  curl said: ${CURL_ERR:-(no message)}
+
+The host IS reachable -- the same request without verification returned
+$INSECURE_CODE -- so the credential and the network are fine. The CA at
+$CONF_DIR/pve-ca.pem does not validate what $PROXMOX_HOST is presenting.
+
+Usually one of:
+
+  * You gave a hostname that is not in the certificate. PVE's default cert
+    carries the node name and its IP; anything else (a DNS alias, a FQDN it
+    does not know about) fails verification. Re-run with the address that is
+    actually in the cert -- often the bare IP:
+        --proxmox-host <ip>
+
+  * The node uses an ACME/Let's Encrypt or custom certificate, so the
+    cluster CA is not its issuer. In that case point at the system trust
+    store instead: delete $CONF_DIR/pve-ca.pem, re-run, then set
+    REQUESTS_CA_BUNDLE and SSL_CERT_FILE in
+    $CONF_DIR/proxmox-mcp.env to /etc/ssl/certs/ca-certificates.crt
+
+  * A stale CA from an earlier run, or the node regenerated its certs.
+    Delete $CONF_DIR/pve-ca.pem and re-run to re-fetch it.
+
+Inspect what is actually being presented with:
+    openssl s_client -connect $PROXMOX_HOST:8006 -showcerts </dev/null"
+  fi
+
+  die "could not reach $PROXMOX_HOST:8006 at all.
+
+  curl said: ${CURL_ERR:-(no message)}
+
+Not a credential problem -- nothing answered. Check that the container can
+route to the Proxmox host, that 8006 is open, and that the address is right."
+fi
+
+if [[ "$CODE" != "200" ]]; then
+  case "$CODE" in
+    401) die "Proxmox rejected the credential (401).
+Wrong realm (@pam vs @pve), a mistyped secret, or a disabled account.
+The token ID you gave was: $TOKEN_ID" ;;
+    403) die "Proxmox returned 403 -- the credential is valid but not permitted
+to read /version. That is unusual; check the account is not restricted." ;;
+    *)   die "Proxmox returned $CODE for /version. ${CURL_ERR:-}" ;;
+  esac
+fi
+note "authenticates (200), TLS verified against the pinned CA"
 
 NODE_COUNT="$(curl -s --max-time 15 --cacert "$CONF_DIR/pve-ca.pem" \
   -H "Authorization: $PVE_TOKEN" "https://$PROXMOX_HOST:8006/api2/json/nodes" \
