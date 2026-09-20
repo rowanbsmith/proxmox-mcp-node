@@ -40,29 +40,32 @@ python3 -c "import urllib.request;print(urllib.request.urlopen('https://raw.gith
 sudo bash install.sh
 ```
 
-It asks for three things:
+It asks four things:
 
 | | |
 |---|---|
 | Proxmox host | IP or hostname of the PVE node |
-| Proxmox API token | `PVEAPIToken=user@realm!id=secret` — see below |
-| Client IP | the one host allowed to reach the MCP port |
+| Token ID | `svc-mcp@pam!mcpadmin` — exactly as the PVE GUI shows it |
+| Token secret | the UUID shown once when you created it |
+| Client IP | host(s) allowed to reach the MCP port; comma-separate for several |
 
 and prints the endpoint URL and a generated bearer token when it's done.
 
 ### Unattended
 
-Pass all three and it asks nothing:
+Pass them all and it asks nothing:
 
 ```bash
 wget -qO- <url>/install.sh | sudo bash -s -- \
   --proxmox-host 192.0.2.10 \
-  --token 'PVEAPIToken=svc-mcp@pam!mcp-node=SECRET' \
+  --token-id 'svc-mcp@pam!mcpadmin' \
+  --secret '00000000-0000-0000-0000-000000000000' \
   --client 192.0.2.20
 ```
 
 Also: `--port` (default 8000), `--api-key` (default: generated),
-`--no-firewall`.
+`--no-firewall`, and `--token` if you'd rather hand over the assembled
+`PVEAPIToken=user@realm!id=secret` header in one piece.
 
 Re-running is safe — it won't overwrite an existing token, bearer key or CA.
 
@@ -76,7 +79,10 @@ pveum user token add svc-mcp@pam mcp-node --privsep 1
 pveum acl modify / --tokens 'svc-mcp@pam!mcp-node' --roles Administrator
 ```
 
-The secret prints **once**. Paste it straight into the installer.
+The secret prints **once**. The installer asks for the **Token ID** and the
+**secret** as two separate fields, matching what the GUI shows you — paste
+each straight in. (It also copes with the whole `id=secret` string pasted into
+the first field.)
 
 ### The gotcha that catches everyone
 

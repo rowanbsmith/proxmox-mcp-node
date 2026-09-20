@@ -5,15 +5,19 @@
 # Installs a systemd service that exposes the Proxmox VE API as MCP tools over
 # Streamable HTTP, listening on a port you point an MCP client at.
 #
-#     curl -fsSL <raw-url>/install.sh | sudo bash
+#     wget -qO- <raw-url>/install.sh | sudo bash
 #
-# Asks for three things, or takes them as flags/env for a fully unattended run:
+# Asks four things, or takes them as flags/env for a fully unattended run:
 #
 #     --proxmox-host  the Proxmox node                   (PROXMOX_HOST)
-#     --token         PVEAPIToken=user@realm!id=secret   (PVE_TOKEN)
-#     --client        IP allowed to reach the MCP port   (CLIENT_IP)
+#     --token-id      user@realm!tokenid                 (TOKEN_ID)
+#     --secret        the token secret                   (TOKEN_SECRET)
+#     --client        IPs allowed to reach the MCP port  (CLIENT_IP)
+#
+# Token ID and secret are the two fields the Proxmox GUI shows you.
 #
 # Optional:
+#     --token         the two pre-assembled as a header  (PVE_TOKEN)
 #     --port          listen port, default 8000          (MCP_PORT)
 #     --api-key       inbound bearer token, default: generated  (MCP_API_KEY)
 #     --no-firewall   skip the nftables allowlist
@@ -46,8 +50,12 @@ Proxmox MCP server installer.
 Options (or pass as environment variables):
 
   --proxmox-host HOST   Proxmox node, IP or hostname        (PROXMOX_HOST)
-  --token TOKEN         PVEAPIToken=user@realm!id=secret    (PVE_TOKEN)
-  --client IP           IP allowed to reach the MCP port    (CLIENT_IP)
+  --token-id ID         user@realm!tokenid                  (TOKEN_ID)
+  --secret UUID         the token secret                    (TOKEN_SECRET)
+  --client IP[,IP]      IPs/CIDRs allowed to reach the port (CLIENT_IP)
+
+  --token TOKEN         the two above pre-assembled:        (PVE_TOKEN)
+                        PVEAPIToken=user@realm!id=secret
 
   --port PORT           listen port, default 8000           (MCP_PORT)
   --api-key KEY         inbound bearer token, default: generated  (MCP_API_KEY)
@@ -63,6 +71,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --proxmox-host) PROXMOX_HOST="$2"; shift 2 ;;
     --token)        PVE_TOKEN="$2"; shift 2 ;;
+    --token-id)     TOKEN_ID="$2"; shift 2 ;;
+    --secret)       TOKEN_SECRET="$2"; shift 2 ;;
     --client)       CLIENT_IP="$2"; shift 2 ;;
     --port)         MCP_PORT="$2"; shift 2 ;;
     --api-key)      MCP_API_KEY="$2"; shift 2 ;;
@@ -87,7 +97,7 @@ ask() {
   ( : < /dev/tty ) 2>/dev/null || die "need a value for $__var but there is no terminal to ask on.
 Pass it as a flag or environment variable for an unattended run:
   wget -qO- <url>/install.sh | sudo bash -s -- \\
-    --proxmox-host <ip> --token 'PVEAPIToken=...' --client <ip>"
+    --proxmox-host <ip> --token-id 'user@realm!tokenid' --secret <uuid> --client <ip>"
   while [[ -z "$__val" ]]; do
     if [[ -n "$__default" ]]; then
       printf '    %s [%s]: ' "$__msg" "$__default" > /dev/tty
@@ -133,22 +143,78 @@ note "Python: $(python3 -V 2>&1 | cut -d' ' -f2)"
 
 say "Configuration"
 ask PROXMOX_HOST "Proxmox host (IP or hostname)"
-ask PVE_TOKEN    "Proxmox API token (PVEAPIToken=user@realm!id=secret)"
-[[ $WITH_FIREWALL -eq 1 ]] && ask CLIENT_IP "IP allowed to reach the MCP port (your MCP client)"
 
-# Parse the token into the three values the server wants. Doing it here means
-# the service needs no wrapper script at runtime.
-PVE_TOKEN="${PVE_TOKEN//$'\n'/}"
-[[ "$PVE_TOKEN" == PVEAPIToken=* ]] \
-  || die "token must be in header form: PVEAPIToken=user@realm!tokenid=secret"
-_body="${PVE_TOKEN#PVEAPIToken=}"
-PVE_USER="${_body%%!*}"
-_rest="${_body#*!}"
-PVE_TOKEN_NAME="${_rest%%=*}"
-PVE_TOKEN_VALUE="${_rest#*=}"
-[[ -n "$PVE_USER" && -n "$PVE_TOKEN_NAME" && -n "$PVE_TOKEN_VALUE" && "$PVE_USER" == *@* ]] \
-  || die "could not parse the token; expected PVEAPIToken=user@realm!tokenid=secret"
-note "token: ${PVE_USER}!${PVE_TOKEN_NAME}"
+# The Proxmox GUI shows a token as two separate fields -- "Token ID" and
+# "Secret" -- so ask for them the same way rather than making you paste them
+# together into a header string you have never seen.
+#
+# --token still takes the assembled header form, for scripted installs.
+trim() { local s="${1//$'\n'/}"; s="${s//$'\r'/}"; echo "${s#"${s%%[![:space:]]*}"}" | sed 's/[[:space:]]*$//'; }
+
+if [[ -n "${PVE_TOKEN:-}" ]]; then
+  PVE_TOKEN="$(trim "$PVE_TOKEN")"
+  [[ "$PVE_TOKEN" == PVEAPIToken=* ]] \
+    || die "--token must be the full header form: PVEAPIToken=user@realm!tokenid=secret
+Or pass the two parts separately: --token-id 'user@realm!tokenid' --secret '<uuid>'"
+  _body="${PVE_TOKEN#PVEAPIToken=}"
+  TOKEN_ID="${_body%%=*}"
+  TOKEN_SECRET="${_body#*=}"
+else
+  ask TOKEN_ID "Token ID     (e.g. svc-mcp@pam!mcpadmin)"
+  TOKEN_ID="$(trim "$TOKEN_ID")"
+  # Be forgiving about what gets pasted in: strip a header prefix, and if the
+  # whole thing came in at once, split the secret back out rather than
+  # rejecting it.
+  TOKEN_ID="${TOKEN_ID#PVEAPIToken=}"
+  if [[ "$TOKEN_ID" == *=* ]]; then
+    TOKEN_SECRET="${TOKEN_ID#*=}"
+    TOKEN_ID="${TOKEN_ID%%=*}"
+  fi
+  [[ -n "${TOKEN_SECRET:-}" ]] || ask TOKEN_SECRET "Token secret (the UUID shown once when you created it)"
+fi
+
+TOKEN_ID="$(trim "$TOKEN_ID")"
+TOKEN_SECRET="$(trim "$TOKEN_SECRET")"
+
+# user@realm!tokenid -- the realm matters and getting it wrong is an
+# indistinguishable 401 later, so check the shape now.
+[[ "$TOKEN_ID" == *@*!* ]] \
+  || die "token ID should look like user@realm!tokenid (got: '$TOKEN_ID')
+The Proxmox GUI shows it in the token list, e.g. svc-mcp@pam!mcpadmin"
+[[ -n "$TOKEN_SECRET" ]] || die "the token secret is empty"
+
+PVE_USER="${TOKEN_ID%%!*}"
+PVE_TOKEN_NAME="${TOKEN_ID#*!}"
+PVE_TOKEN="PVEAPIToken=${TOKEN_ID}=${TOKEN_SECRET}"
+note "token: ${TOKEN_ID}"
+
+if [[ $WITH_FIREWALL -eq 1 ]]; then
+  ask CLIENT_IP "IP allowed to reach the MCP port (your MCP client)"
+  CLIENT_IP="$(trim "$CLIENT_IP")"
+  # Accept a comma-separated list; validate each element so a typo fails here
+  # rather than as an nftables syntax error three steps later.
+  _norm=""
+  IFS=',' read -ra _parts <<< "$CLIENT_IP"
+  for _p in "${_parts[@]}"; do
+    _p="$(trim "$_p")"
+    [[ -z "$_p" ]] && continue
+    [[ "$_p" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] \
+      || die "'$_p' is not an IPv4 address or CIDR block"
+    _norm="${_norm:+$_norm, }$_p"
+  done
+  [[ -n "$_norm" ]] || die "no valid client address given"
+  CLIENT_IP="$_norm"
+
+  # 0.0.0.0/0 is valid nftables and means "everyone" -- it turns the allowlist
+  # into decoration. Accepted, because you may genuinely be firewalling
+  # elsewhere, but not silently.
+  if [[ "$CLIENT_IP" == *"0.0.0.0/0"* ]]; then
+    printf '\n\033[33m    WARNING: 0.0.0.0/0 allows every host that can route here.\n'
+    printf '    The bearer token becomes the only thing protecting Administrator\n'
+    printf '    access to %s. Use --no-firewall if that is deliberate.\033[0m\n' "$PROXMOX_HOST"
+  fi
+  note "allowlist: $CLIENT_IP"
+fi
 
 # ----------------------------------------------------------------- packages
 
