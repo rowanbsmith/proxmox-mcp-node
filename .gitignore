@@ -1,0 +1,4 @@
+# Nothing is built in this repo -- install.sh is self-contained and everything
+# it creates lives under /etc, /opt and /var/lib on the target.
+*.pyc
+__pycache__/
