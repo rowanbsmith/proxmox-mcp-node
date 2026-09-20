@@ -34,6 +34,31 @@ APP_DIR="/opt/proxmox-mcp"
 MCP_PORT="${MCP_PORT:-8000}"
 WITH_FIREWALL=1
 
+# Embedded rather than read back out of "$0": piped through `bash -s --`, $0 is
+# "bash" and there is no file to read.
+usage() {
+  cat <<'USAGE'
+Proxmox MCP server installer.
+
+  wget -qO- <url>/install.sh | sudo bash                  interactive
+  wget -qO- <url>/install.sh | sudo bash -s -- [options]  unattended
+
+Options (or pass as environment variables):
+
+  --proxmox-host HOST   Proxmox node, IP or hostname        (PROXMOX_HOST)
+  --token TOKEN         PVEAPIToken=user@realm!id=secret    (PVE_TOKEN)
+  --client IP           IP allowed to reach the MCP port    (CLIENT_IP)
+
+  --port PORT           listen port, default 8000           (MCP_PORT)
+  --api-key KEY         inbound bearer token, default: generated  (MCP_API_KEY)
+  --no-firewall         skip the nftables allowlist
+  -h, --help            this
+
+Anything not supplied is prompted for, so a plain run asks three questions.
+Re-running is safe: an existing token, bearer key or CA is left alone.
+USAGE
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --proxmox-host) PROXMOX_HOST="$2"; shift 2 ;;
@@ -42,8 +67,8 @@ while [[ $# -gt 0 ]]; do
     --port)         MCP_PORT="$2"; shift 2 ;;
     --api-key)      MCP_API_KEY="$2"; shift 2 ;;
     --no-firewall)  WITH_FIREWALL=0; shift ;;
-    -h|--help)      sed -n '2,25p' "$0"; exit 0 ;;
-    *) echo "unknown option: $1" >&2; exit 2 ;;
+    -h|--help)      usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; echo; usage >&2; exit 2 ;;
   esac
 done
 
@@ -61,7 +86,8 @@ ask() {
   # fails with a raw shell error instead of something actionable. Probe it.
   ( : < /dev/tty ) 2>/dev/null || die "need a value for $__var but there is no terminal to ask on.
 Pass it as a flag or environment variable for an unattended run:
-  $0 --proxmox-host <ip> --token 'PVEAPIToken=...' --client <ip>"
+  wget -qO- <url>/install.sh | sudo bash -s -- \\
+    --proxmox-host <ip> --token 'PVEAPIToken=...' --client <ip>"
   while [[ -z "$__val" ]]; do
     if [[ -n "$__default" ]]; then
       printf '    %s [%s]: ' "$__msg" "$__default" > /dev/tty
