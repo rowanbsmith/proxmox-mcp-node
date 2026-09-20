@@ -6,6 +6,11 @@ TCP port you point an MCP client at.
 Streamable HTTP, bearer auth, TLS verified to Proxmox, nftables allowlist,
 systemd. One script installs the lot.
 
+> **Use the hostname on your Proxmox certificate**, not its IP. ACME issuers
+> sign DNS names only, so a node with a real certificate fails verification
+> when dialled by IP. The installer detects this and tells you which name to
+> use. A self-signed node is fine either way — it pins the cluster CA instead.
+
 ## Install
 
 On a fresh Debian 12/13 container:
@@ -127,7 +132,7 @@ nft list table inet proxmox_mcp
 |---|---|
 | `/etc/proxmox-mcp/proxmox-mcp.env` | config **and secrets**, 0640 |
 | `/etc/proxmox-mcp/firewall.nft` | client allowlist |
-| `/etc/proxmox-mcp/pve-ca.pem` | pinned Proxmox CA |
+| `/etc/proxmox-mcp/pve-ca.pem` | only if the node is self-signed |
 | `/opt/proxmox-mcp/.venv` | the Python environment |
 | `/var/lib/proxmox-mcp/` | job state |
 

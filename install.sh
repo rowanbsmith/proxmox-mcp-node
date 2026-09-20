@@ -29,7 +29,9 @@
 
 set -euo pipefail
 
-VERSION="0.5.18"                       # proxmox-mcp-plus release to install
+MCP_PLUS_VERSION="0.5.18"              # proxmox-mcp-plus release to install
+# NB: do not call this VERSION. Preflight sources /etc/os-release, which
+# defines VERSION ("13 (trixie)") and would silently overwrite it.
 SERVICE_USER="proxmox-mcp"
 CONF_DIR="/etc/proxmox-mcp"
 STATE_DIR="/var/lib/proxmox-mcp"
@@ -185,6 +187,7 @@ The Proxmox GUI shows it in the token list, e.g. svc-mcp@pam!mcpadmin"
 
 PVE_USER="${TOKEN_ID%%!*}"
 PVE_TOKEN_NAME="${TOKEN_ID#*!}"
+PVE_TOKEN_VALUE="$TOKEN_SECRET"
 PVE_TOKEN="PVEAPIToken=${TOKEN_ID}=${TOKEN_SECRET}"
 note "token: ${TOKEN_ID}"
 
@@ -248,7 +251,7 @@ note "$SERVICE_USER, $CONF_DIR, $STATE_DIR"
 
 # ---------------------------------------------------------------- python env
 
-say "Installing proxmox-mcp-plus $VERSION"
+say "Installing proxmox-mcp-plus $MCP_PLUS_VERSION"
 [[ -x "$APP_DIR/.venv/bin/python" ]] || python3 -m venv "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install -q --upgrade pip
 
@@ -317,37 +320,136 @@ LOCK
   || die "the installed package failed to import"
 note "$APP_DIR/.venv"
 
-# ------------------------------------------------------------------- the CA
+# ------------------------------------------------------------------ Proxmox TLS
 
-# The server refuses verify_ssl=false unless dev_mode is also on, and running
-# production in dev mode to dodge a self-signed cert is a bad trade. So pin
-# Proxmox's own cluster CA and keep verification on.
+# Verify against the system trust store, which is all that is needed once the
+# node has a real certificate (Let's Encrypt or otherwise). Only if that fails
+# do we fall back to pinning Proxmox's own cluster CA -- a self-signed default
+# install cannot be verified any other way, and the server refuses
+# verify_ssl=false unless dev_mode is also on, which is a worse trade.
 say "Proxmox TLS"
-if [[ ! -s "$CONF_DIR/pve-ca.pem" ]]; then
-  NODE="$(curl -sk --max-time 15 -H "Authorization: $PVE_TOKEN" \
-    "https://$PROXMOX_HOST:8006/api2/json/nodes" \
-    | python3 -c 'import sys,json
+
+SYSTEM_CA="/etc/ssl/certs/ca-certificates.crt"
+PVE_CA=""          # empty => use the system trust store
+
+_ERRF="$(mktemp)"; trap 'rm -f "$_ERRF"' EXIT
+
+probe_tls() {
+  # $1 = --cacert argument, or "" for the system store.
+  # Echoes the HTTP code; 000 means no response. A 401 still proves TLS is
+  # fine, so the caller must not treat it as a TLS failure.
+  local ca_args=()
+  [[ -n "$1" ]] && ca_args=(--cacert "$1")
+  curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+    "${ca_args[@]}" -H "Authorization: $PVE_TOKEN" \
+    "https://$PROXMOX_HOST:8006/api2/json/version" 2>"$_ERRF" || true
+}
+
+CODE="$(probe_tls "$SYSTEM_CA")"
+CURL_ERR="$(tr -d '\r' < "$_ERRF" | grep -m1 '^curl:' || tr -d '\r' < "$_ERRF" | head -1)"
+
+if [[ "$CODE" != "000" ]]; then
+  note "verified against the system trust store -- no CA pinning needed"
+  # A CA left behind by an older install would otherwise sit there unused and
+  # confuse the next person to read the config.
+  if [[ -e "$CONF_DIR/pve-ca.pem" ]]; then
+    mv "$CONF_DIR/pve-ca.pem" "$CONF_DIR/pve-ca.pem.unused"
+    note "moved the previously pinned CA aside (pve-ca.pem.unused)"
+  fi
+elif [[ "$CURL_ERR" == *"subject name"* || "$CURL_ERR" == *"not match"* ]]; then
+  # The certificate is trusted -- it just is not for this name. Pinning cannot
+  # fix that, so do not fall back. Say which names the cert actually carries
+  # and stop. This is the normal outcome of dialling a node by IP once it has
+  # a real certificate, because ACME issues for DNS names only.
+  _peer="$(echo | openssl s_client -connect "$PROXMOX_HOST:8006" 2>/dev/null || true)"
+  CERT_NAMES="$(printf '%s' "$_peer" | openssl x509 -noout -ext subjectAltName 2>/dev/null \
+    | tail -n +2 | tr -d ' ' | sed 's/DNS://g' || true)"
+  CERT_SUBJ="$(printf '%s' "$_peer" | openssl x509 -noout -subject 2>/dev/null || true)"
+  die "the certificate is trusted, but it is not valid for '$PROXMOX_HOST'.
+
+  curl said:  ${CURL_ERR:-(no message)}
+  ${CERT_SUBJ:-}
+  valid for:  ${CERT_NAMES:-(could not read the SAN)}
+
+Re-run using a name the certificate covers:
+
+    --proxmox-host ${CERT_NAMES%%,*}
+
+ACME issuers (Let's Encrypt and friends) sign DNS names only, never bare IPs,
+so connecting by IP always fails this check once you move off the self-signed
+default. Check this container can resolve that name."
+
+else
+  note "not verifiable against the system trust store: ${CURL_ERR:-(no message)}"
+
+  # Reachable at all? If not, this is a network problem, not a TLS one.
+  if [[ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 \
+        -H "Authorization: $PVE_TOKEN" \
+        "https://$PROXMOX_HOST:8006/api2/json/version" 2>/dev/null || true)" == "000" ]]; then
+    die "could not reach $PROXMOX_HOST:8006 at all.
+
+  curl said: ${CURL_ERR:-(no message)}
+
+Nothing answered, so this is not a credential or certificate problem. Check
+that this container can route to the Proxmox host and that 8006 is open."
+  fi
+
+  note "falling back to pinning the Proxmox cluster CA (self-signed node)"
+
+  if [[ ! -s "$CONF_DIR/pve-ca.pem" ]]; then
+    # Check the status before parsing. Feeding an error page to a JSON parser
+    # turns a plain 401 into "could not list nodes", which reads as a
+    # permissions problem and sends you to entirely the wrong place.
+    _nodes="$(curl -sk --max-time 20 -w '\n%{http_code}' \
+      -H "Authorization: $PVE_TOKEN" \
+      "https://$PROXMOX_HOST:8006/api2/json/nodes" 2>/dev/null)" || true
+    _ncode="${_nodes##*$'\n'}"
+    _nbody="${_nodes%$'\n'*}"
+    case "$_ncode" in
+      200) ;;
+      401) die "Proxmox rejected the credential (401) while reading the node list.
+Wrong realm (@pam vs @pve), a mistyped secret, or the token has been revoked.
+The token ID you gave was: $TOKEN_ID" ;;
+      *)   die "Proxmox returned $_ncode for /nodes; cannot continue." ;;
+    esac
+    NODE="$(printf '%s' "$_nbody" | python3 -c 'import sys,json
 d=json.load(sys.stdin).get("data") or []
 print(d[0]["node"] if d else "")' 2>/dev/null)" || true
-  [[ -n "$NODE" ]] || die "could not list nodes on $PROXMOX_HOST.
-Either the host is wrong, or the token has no privileges -- see README,
-'the gotcha that catches everyone'."
+    [[ -n "$NODE" ]] || die "the token authenticates but can see no nodes.
+You almost certainly granted Administrator to the token but not to the user --
+see README, 'the gotcha that catches everyone'."
 
-  curl -sk --max-time 15 -H "Authorization: $PVE_TOKEN" \
-    "https://$PROXMOX_HOST:8006/api2/json/nodes/$NODE/certificates/info" \
-    | python3 -c 'import sys,json
+    curl -sk --max-time 20 -H "Authorization: $PVE_TOKEN" \
+      "https://$PROXMOX_HOST:8006/api2/json/nodes/$NODE/certificates/info" \
+      | python3 -c 'import sys,json
 d=json.load(sys.stdin).get("data") or []
 m=[c for c in d if c.get("filename")=="pve-root-ca.pem"]
 sys.stdout.write(m[0]["pem"] if m else "")' > "$CONF_DIR/pve-ca.pem"
 
-  [[ -s "$CONF_DIR/pve-ca.pem" ]] || die "could not retrieve the Proxmox CA"
-  chmod 0644 "$CONF_DIR/pve-ca.pem"
-  note "node: $NODE"
-  note "CA fingerprint (compare on the host with:"
-  note "  openssl x509 -in /etc/pve/pve-root-ca.pem -noout -fingerprint -sha256)"
-  note "  $(openssl x509 -in "$CONF_DIR/pve-ca.pem" -noout -fingerprint -sha256 | cut -d= -f2)"
-else
-  note "$CONF_DIR/pve-ca.pem exists; left untouched"
+    [[ -s "$CONF_DIR/pve-ca.pem" ]] || die "could not retrieve the Proxmox cluster CA"
+    chmod 0644 "$CONF_DIR/pve-ca.pem"
+    note "node: $NODE"
+    note "CA SHA256: $(openssl x509 -in "$CONF_DIR/pve-ca.pem" -noout -fingerprint -sha256 | cut -d= -f2)"
+    note "  verify on the host: openssl x509 -in /etc/pve/pve-root-ca.pem -noout -fingerprint -sha256"
+  else
+    note "reusing $CONF_DIR/pve-ca.pem"
+  fi
+
+  PVE_CA="$CONF_DIR/pve-ca.pem"
+
+  # Prove the pinned CA actually validates before writing it into the config.
+  CODE="$(probe_tls "$PVE_CA")"
+  CURL_ERR="$(tr -d '\r' < "$_ERRF" | grep -m1 '^curl:' || tr -d '\r' < "$_ERRF" | head -1)"
+  [[ "$CODE" != "000" ]] || die "the pinned CA does not validate $PROXMOX_HOST either.
+
+  curl said: ${CURL_ERR:-(no message)}
+
+Most often the address you gave is not in the certificate: PVE's default cert
+carries the node name and its IP, so a DNS alias or unknown FQDN fails. Re-run
+with the address that is in the cert, often the bare IP. If the node uses a
+custom certificate the cluster CA did not issue, delete
+$CONF_DIR/pve-ca.pem and install that issuer into the system trust store
+instead."
 fi
 
 # --------------------------------------------------------- validate the token
@@ -357,11 +459,8 @@ fi
 # reports success at every layer that only checks status codes.
 say "Checking the token"
 
-_ERRF="$(mktemp)"; trap 'rm -f "$_ERRF"' EXIT
 
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
-  --cacert "$CONF_DIR/pve-ca.pem" -H "Authorization: $PVE_TOKEN" \
-  "https://$PROXMOX_HOST:8006/api2/json/version" 2>"$_ERRF")" || true
+CODE="$(probe_tls "$PVE_CA")"
 # curl writes a multi-line explanation for TLS failures; the first line is the
 # one that names the actual problem ("curl: (60) SSL certificate problem:
 # ..."). The remaining lines are boilerplate pointing at a web page, so taking
@@ -427,7 +526,7 @@ to read /version. That is unusual; check the account is not restricted." ;;
 fi
 note "authenticates (200), TLS verified against the pinned CA"
 
-NODE_COUNT="$(curl -s --max-time 15 --cacert "$CONF_DIR/pve-ca.pem" \
+NODE_COUNT="$(curl -s --max-time 20 ${PVE_CA:+--cacert "$PVE_CA"} \
   -H "Authorization: $PVE_TOKEN" "https://$PROXMOX_HOST:8006/api2/json/nodes" \
   | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("data") or []))')" || true
 [[ "${NODE_COUNT:-0}" -gt 0 ]] || die "the token authenticates but can see no nodes.
@@ -462,9 +561,9 @@ PROXMOX_USER=$PVE_USER
 PROXMOX_TOKEN_NAME=$PVE_TOKEN_NAME
 PROXMOX_TOKEN_VALUE=$PVE_TOKEN_VALUE
 
-# Verify Proxmox against its own pinned cluster CA rather than disabling TLS.
-REQUESTS_CA_BUNDLE=$CONF_DIR/pve-ca.pem
-SSL_CERT_FILE=$CONF_DIR/pve-ca.pem
+# TLS to Proxmox is verified, never disabled.
+REQUESTS_CA_BUNDLE=${PVE_CA:-$SYSTEM_CA}
+SSL_CERT_FILE=${PVE_CA:-$SYSTEM_CA}
 
 # Streamable HTTP. MCP_API_KEY is the bearer token clients must present --
 # without it the server would serve Administrator-level tools to anyone who
