@@ -11,7 +11,33 @@ systemd. One script installs the lot.
 On a fresh Debian 12/13 container:
 
 ```bash
+wget -qO- https://raw.githubusercontent.com/rowanbsmith/proxmox-mcp-node/main/install.sh | sudo bash
+```
+
+`wget` is used rather than `curl` because it's the one that's actually there:
+in Debian, `wget` and `ca-certificates` are priority *standard* and ship in a
+base install, while `curl` is *optional* and a minimal container won't have it.
+The installer pulls in `curl` (and `python3`, also not guaranteed) itself.
+
+If your image does have curl:
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/rowanbsmith/proxmox-mcp-node/main/install.sh | sudo bash
+```
+
+Neither? Three ways out, in order of least effort:
+
+```bash
+# 1. install one
+apt-get update && apt-get install -y wget
+
+# 2. push it in from the Proxmox host -- no networking in the container at all
+pct push <vmid> install.sh /root/install.sh --perms 755
+pct exec <vmid> -- /root/install.sh
+
+# 3. python3, if that's what you have
+python3 -c "import urllib.request;print(urllib.request.urlopen('https://raw.githubusercontent.com/rowanbsmith/proxmox-mcp-node/main/install.sh').read().decode())" > install.sh
+sudo bash install.sh
 ```
 
 It asks for three things:
@@ -24,20 +50,12 @@ It asks for three things:
 
 and prints the endpoint URL and a generated bearer token when it's done.
 
-> **This repo is private**, so the URL above 404s for an unauthenticated
-> `curl`. Either make it public, or fetch with a token:
->
-> ```bash
-> gh api repos/rowanbsmith/proxmox-mcp-node/contents/install.sh -q .content \
->   | base64 -d | sudo bash
-> ```
-
 ### Unattended
 
 Pass all three and it asks nothing:
 
 ```bash
-curl -fsSL <url>/install.sh | sudo bash -s -- \
+wget -qO- <url>/install.sh | sudo bash -s -- \
   --proxmox-host 192.0.2.10 \
   --token 'PVEAPIToken=svc-mcp@pam!mcp-node=SECRET' \
   --client 192.0.2.20

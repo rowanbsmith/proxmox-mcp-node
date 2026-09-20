@@ -76,14 +76,31 @@ Pass it as a flag or environment variable for an unattended run:
 
 # ------------------------------------------------------------------ preflight
 
-[[ $EUID -eq 0 ]] || die "run as root:  curl -fsSL <url> | sudo bash"
+[[ $EUID -eq 0 ]] || die "run as root:  wget -qO- <url> | sudo bash"
 
 say "Preflight"
 [[ -r /etc/os-release ]] && . /etc/os-release
 note "OS: ${PRETTY_NAME:-unknown}"
-command -v python3 >/dev/null || die "python3 is not installed"
+
+command -v apt-get >/dev/null || die "this installer is for Debian/Ubuntu (no apt-get found)"
+
+# A minimal container has neither python3 nor curl -- both are priority
+# 'optional' in Debian, so a base root filesystem does not carry them. Pull
+# python3 up front rather than at the package step, so an unsupported version
+# fails before we bother asking any questions.
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v python3 >/dev/null; then
+  note "python3 not present -- installing it"
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends python3 >/dev/null \
+    || die "could not install python3 (apt-get failed)"
+  command -v python3 >/dev/null \
+    || die "apt-get reported success but python3 is still not on PATH"
+fi
+
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' \
-  || die "Python 3.11+ required (proxmox-mcp-plus requires-python >= 3.11); found $(python3 -V)"
+  || die "Python 3.11+ required (proxmox-mcp-plus sets requires-python >= 3.11); found $(python3 -V 2>&1)
+Debian 12 ships 3.11 and Debian 13 ships 3.13. On anything older, use a newer base image."
 note "Python: $(python3 -V 2>&1 | cut -d' ' -f2)"
 
 # ------------------------------------------------------------------- questions
@@ -110,7 +127,6 @@ note "token: ${PVE_USER}!${PVE_TOKEN_NAME}"
 # ----------------------------------------------------------------- packages
 
 say "Packages"
-export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 PKGS="python3 python3-venv ca-certificates curl openssl"
 [[ $WITH_FIREWALL -eq 1 ]] && PKGS="$PKGS nftables"
